@@ -1,0 +1,18 @@
+[1770491173.693] connect_opencode: starting health check loop
+[1770491173.699] connect_opencode: health check passed
+[1770491173.699] connect_opencode: resolving session
+[1770491173.887] connect_opencode: found 1 sessions
+[1770491173.887] connect_opencode: reusing session ses_3c68c0822ffeghLUamkCOjrEIF (tidy-pixel)
+[1770491173.888] connect_opencode: session ready, storing ID for prompt sender
+[1770491173.888] connect_opencode: entering SSE loop
+[1770491173.891] connect_opencode: SSE connected
+[1770491173.897] tui: SSE connected event
+[1770491192.244] send_prompt: queuing prompt (52 chars)
+[[1770491192.244] 1770491192tui: prompt sent successfully
+.245] send_prompt: sending to session ses_3c68c0822ffeghLUamkCOjrEIF
+[1770491192.254] send_prompt: success
+[1770491192.296] tui: prompt sent successfully
+[1770491192.297] tui: session ses_3c68c0822ffeghLUamkCOjrEIF status: busy
+[1770491192.348] tui: session ses_3c68c0822ffeghLUamkCOjrEIF status: busy
+[1770491195.241] tui: session ses_3c68c0822ffeghLUamkCOjrEIF status: busy
+[1770491195.293] tui: session ses_3c68c0822ffeghLUamkCOjrEIF status: idle
