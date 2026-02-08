@@ -119,35 +119,29 @@ impl BrailleCanvas {
 }
 
 /// Render waveform amplitudes onto a braille canvas as a symmetric mirrored display.
+/// Always draws a center line so low-amplitude regions remain visually connected.
 fn render_waveform_to_canvas(bars: &[f32], canvas: &mut BrailleCanvas) {
     let center = canvas.height / 2;
     for (i, &amp) in bars.iter().enumerate() {
         let amp = amp.clamp(0.0, 1.0);
         let extent = (amp * center as f32).round() as usize;
-        if extent == 0 {
-            continue;
-        }
-        // Fill both left and right sub-pixels for each bar
         let px_left = i * 2;
         let px_right = i * 2 + 1;
-        let y_top = center.saturating_sub(extent);
-        let y_bot = (center + extent - 1).min(canvas.height - 1);
-        canvas.fill_vertical_line(px_left, y_top, y_bot);
-        canvas.fill_vertical_line(px_right, y_top, y_bot);
+        if extent == 0 {
+            // Always draw center dots so the baseline is unbroken
+            canvas.set_dot(px_left, center);
+            canvas.set_dot(px_right, center);
+        } else {
+            let y_top = center.saturating_sub(extent);
+            let y_bot = (center + extent - 1).min(canvas.height - 1);
+            canvas.fill_vertical_line(px_left, y_top, y_bot);
+            canvas.fill_vertical_line(px_right, y_top, y_bot);
+        }
     }
 }
 
-/// Pick a color based on amplitude: green (low) -> yellow (mid) -> red (high).
-fn waveform_color(amplitude: f32) -> Color {
-    let a = amplitude.clamp(0.0, 1.0);
-    if a < 0.30 {
-        Color::Green
-    } else if a < 0.60 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
-}
+/// Waveform display color.
+const WAVEFORM_COLOR: Color = Color::Cyan;
 
 /// Compute RMS energy for each of `num_windows` equal-sized chunks of samples.
 ///
@@ -292,17 +286,15 @@ impl Widget for WaveformWidget<'_> {
         render_waveform_to_canvas(&bars, &mut canvas);
         let grid = canvas.to_braille_grid();
 
+        let style = Style::default().fg(WAVEFORM_COLOR);
         for (row_idx, row) in grid.iter().enumerate() {
-            for (col_idx, &ch) in row.iter().enumerate() {
-                let amp = bars[col_idx.min(bars.len() - 1)];
-                let color = waveform_color(amp);
-                buf.set_string(
-                    area.x + 2 + col_idx as u16,
-                    area.y + row_idx as u16,
-                    &ch.to_string(),
-                    Style::default().fg(color),
-                );
-            }
+            let s: String = row.iter().collect();
+            buf.set_string(
+                area.x,
+                area.y + row_idx as u16,
+                &s,
+                style,
+            );
         }
     }
 }
@@ -381,8 +373,12 @@ mod tests {
         let bars = vec![0.0; 5];
         let mut canvas = BrailleCanvas::new(5, 3);
         render_waveform_to_canvas(&bars, &mut canvas);
-        // All dots should be false (no extent for 0 amplitude)
-        assert!(canvas.dots.iter().all(|&d| !d));
+        // Silence should still draw center line dots
+        let center = canvas.height / 2;
+        for i in 0..5 {
+            assert!(canvas.get_dot(i * 2, center));
+            assert!(canvas.get_dot(i * 2 + 1, center));
+        }
     }
 
     #[test]
@@ -516,12 +512,6 @@ mod tests {
         assert!(data.bars.is_empty());
     }
 
-    #[test]
-    fn test_waveform_color() {
-        assert_eq!(waveform_color(0.1), Color::Green);
-        assert_eq!(waveform_color(0.4), Color::Yellow);
-        assert_eq!(waveform_color(0.8), Color::Red);
-    }
 
     #[test]
     fn test_rolling_window() {

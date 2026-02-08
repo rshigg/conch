@@ -53,14 +53,8 @@ struct App {
     error: Option<String>,
     /// Whether we're waiting for a background transcription.
     pending_transcript: bool,
-    /// Scrolling waveform: persistent RMS values, one per column.
+    /// Waveform amplitudes for current frame, one per display column.
     waveform_bars: Vec<f32>,
-    /// How many samples the audio module had written as of last update.
-    last_sample_count: usize,
-    /// How many audio samples map to one display column.
-    samples_per_column: usize,
-    /// Leftover new samples not yet enough to fill a column.
-    leftover_samples: usize,
     /// Transcript pending user confirmation before sending to OpenCode.
     prompt_pending: Option<String>,
     /// OpenCode connection status.
@@ -72,20 +66,13 @@ struct App {
 }
 
 impl App {
-    fn new(sample_rate: u32) -> Self {
-        // Each column represents ~25ms of audio (40 columns/sec).
-        // At 50ms frame intervals this yields ~2 new columns per frame
-        // for smooth, steady scrolling.
-        let samples_per_column = (sample_rate as usize) / 40;
+    fn new(_sample_rate: u32) -> Self {
         Self {
             state: RecordingState::Idle,
             transcripts: Vec::new(),
             error: None,
             pending_transcript: false,
             waveform_bars: Vec::new(),
-            last_sample_count: 0,
-            samples_per_column,
-            leftover_samples: 0,
             prompt_pending: None,
             connection_status: ConnectionStatus::Disconnected,
             session_slug: None,
@@ -245,44 +232,25 @@ async fn run_app(
             }
         }
 
-        // Waveform column budget: terminal width minus borders (2) and indicator+space (2)
-        let max_columns = (terminal.size()?.width as usize).saturating_sub(4);
-
-        // Update scrolling waveform if recording
+        // Snapshot waveform from ring buffer each frame
+        let num_columns = terminal.size()?.width as usize;
         if app.state == RecordingState::Recording {
-            let total = audio.total_samples_written();
-            let new_count = total.saturating_sub(app.last_sample_count);
-            app.last_sample_count = total;
-
-            if new_count > 0 {
-                let new_samples = audio.read_last_samples(new_count);
-                let available = app.leftover_samples + new_samples.len();
-                let full_columns = available / app.samples_per_column;
-                app.leftover_samples = available % app.samples_per_column;
-
-                if full_columns > 0 {
-                    let rms_windows = viz::compute_rms_windows(&new_samples, full_columns);
-                    for rms in rms_windows {
-                        let normalized = (rms / 0.15).clamp(0.0, 1.0);
-                        let value = if normalized < NOISE_FLOOR {
-                            0.0
-                        } else {
-                            normalized
-                        };
-                        app.waveform_bars.push(value);
-                    }
-                    // Trim to widget width — oldest columns scroll off the left
-                    if app.waveform_bars.len() > max_columns {
-                        let excess = app.waveform_bars.len() - max_columns;
-                        app.waveform_bars.drain(..excess);
-                    }
-                }
+            // Read ~100ms of recent audio for the snapshot
+            let snapshot_samples = audio.sample_rate() as usize / 10;
+            let samples = audio.read_last_samples(snapshot_samples);
+            if !samples.is_empty() {
+                let rms = viz::compute_rms_windows(&samples, num_columns);
+                app.waveform_bars = rms
+                    .into_iter()
+                    .map(|v| {
+                        // Boost: divide by a low reference so moderate speech fills the display
+                        let boosted = (v / 0.04).clamp(0.0, 1.0);
+                        if boosted < NOISE_FLOOR { 0.0 } else { boosted }
+                    })
+                    .collect();
             }
-        } else if app.state == RecordingState::Idle && !app.waveform_bars.is_empty() {
-            // Clear scrolling state when idle
+        } else if !app.waveform_bars.is_empty() {
             app.waveform_bars.clear();
-            app.last_sample_count = 0;
-            app.leftover_samples = 0;
         }
 
         // Draw UI
