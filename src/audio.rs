@@ -24,6 +24,8 @@ pub struct RingBuffer {
     capacity: usize,
     write_pos: usize,
     count: usize,
+    /// Monotonically increasing count of all samples ever written.
+    total_written: usize,
 }
 
 impl RingBuffer {
@@ -34,6 +36,7 @@ impl RingBuffer {
             capacity,
             write_pos: 0,
             count: 0,
+            total_written: 0,
         }
     }
 
@@ -47,6 +50,7 @@ impl RingBuffer {
                 self.count += 1;
             }
         }
+        self.total_written += samples.len();
     }
 
     /// Read all valid samples in chronological order (oldest first).
@@ -94,6 +98,12 @@ impl RingBuffer {
     pub fn clear(&mut self) {
         self.write_pos = 0;
         self.count = 0;
+        self.total_written = 0;
+    }
+
+    /// Total number of samples ever written (monotonically increasing, reset on clear).
+    pub fn total_written(&self) -> usize {
+        self.total_written
     }
 
     /// Number of valid samples in the buffer.
@@ -208,6 +218,11 @@ impl AudioCapture {
         } else {
             Vec::new()
         }
+    }
+
+    /// Total samples written since recording started (monotonically increasing).
+    pub fn total_samples_written(&self) -> usize {
+        self.shared.lock().unwrap().buffer.total_written()
     }
 
     /// The sample rate of the audio input device in Hz.

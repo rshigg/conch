@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
@@ -33,15 +33,13 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use audio::{AudioCapture, RecordingState};
 use stt::Transcriber;
-use transport::{ConnectionStatus, OpenCodeClient, ServerEvent, extract_sse_data_lines, parse_sse_event};
-use viz::{SpectrumData, SpectrogramWidget};
+use transport::{
+    ConnectionStatus, OpenCodeClient, ServerEvent, extract_sse_data_lines, parse_sse_event,
+};
+use viz::{WaveformData, WaveformWidget};
 
-/// FFT size for spectrum computation (1024 samples ~ 64ms at 16kHz).
-const FFT_SIZE: usize = 1024;
-/// Number of frequency bars to display.
-const NUM_BARS: usize = 32;
-/// Noise floor threshold for spectrum normalization.
-const NOISE_FLOOR: f32 = 0.0001;
+/// Noise floor threshold for RMS normalization.
+const NOISE_FLOOR: f32 = 0.001;
 /// OpenCode server base URL.
 const OPENCODE_URL: &str = "http://127.0.0.1:4096";
 
@@ -55,8 +53,14 @@ struct App {
     error: Option<String>,
     /// Whether we're waiting for a background transcription.
     pending_transcript: bool,
-    /// Current spectrum data for the visualizer.
-    spectrum: SpectrumData,
+    /// Scrolling waveform: persistent RMS values, one per column.
+    waveform_bars: Vec<f32>,
+    /// How many samples the audio module had written as of last update.
+    last_sample_count: usize,
+    /// How many audio samples map to one display column.
+    samples_per_column: usize,
+    /// Leftover new samples not yet enough to fill a column.
+    leftover_samples: usize,
     /// Transcript pending user confirmation before sending to OpenCode.
     prompt_pending: Option<String>,
     /// OpenCode connection status.
@@ -68,13 +72,20 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(sample_rate: u32) -> Self {
+        // Each column represents ~25ms of audio (40 columns/sec).
+        // At 50ms frame intervals this yields ~2 new columns per frame
+        // for smooth, steady scrolling.
+        let samples_per_column = (sample_rate as usize) / 40;
         Self {
             state: RecordingState::Idle,
             transcripts: Vec::new(),
             error: None,
             pending_transcript: false,
-            spectrum: SpectrumData::empty(),
+            waveform_bars: Vec::new(),
+            last_sample_count: 0,
+            samples_per_column,
+            leftover_samples: 0,
             prompt_pending: None,
             connection_status: ConnectionStatus::Disconnected,
             session_slug: None,
@@ -161,7 +172,7 @@ async fn run_app(
     transcriber: &Arc<Transcriber>,
     session_flag: Option<String>,
 ) -> Result<()> {
-    let mut app = App::new();
+    let mut app = App::new(audio.sample_rate());
 
     // Channel for all messages to the TUI
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppMessage>();
@@ -200,11 +211,18 @@ async fn run_app(
                         app.connection_status = ConnectionStatus::Connected;
                     }
                     ServerEvent::SessionStatus { session_id, busy } => {
-                        log(&format!("tui: session {} status: {}", session_id, if busy { "busy" } else { "idle" }));
+                        log(&format!(
+                            "tui: session {} status: {}",
+                            session_id,
+                            if busy { "busy" } else { "idle" }
+                        ));
                         app.opencode_busy = busy;
                     }
                     ServerEvent::Tool(ref te) => {
-                        log(&format!("tui: tool event: {} (state: {})", te.tool, te.state));
+                        log(&format!(
+                            "tui: tool event: {} (state: {})",
+                            te.tool, te.state
+                        ));
                         // TODO: Phase 4 — forward to focus module
                     }
                     ServerEvent::Heartbeat => {}
@@ -227,15 +245,44 @@ async fn run_app(
             }
         }
 
-        // Update spectrum data if recording
+        // Waveform column budget: terminal width minus borders (2) and indicator+space (2)
+        let max_columns = (terminal.size()?.width as usize).saturating_sub(4);
+
+        // Update scrolling waveform if recording
         if app.state == RecordingState::Recording {
-            let samples = audio.read_last_samples(FFT_SIZE);
-            if samples.len() >= FFT_SIZE {
-                app.spectrum =
-                    SpectrumData::from_samples(&samples, FFT_SIZE, NUM_BARS, NOISE_FLOOR);
+            let total = audio.total_samples_written();
+            let new_count = total.saturating_sub(app.last_sample_count);
+            app.last_sample_count = total;
+
+            if new_count > 0 {
+                let new_samples = audio.read_last_samples(new_count);
+                let available = app.leftover_samples + new_samples.len();
+                let full_columns = available / app.samples_per_column;
+                app.leftover_samples = available % app.samples_per_column;
+
+                if full_columns > 0 {
+                    let rms_windows = viz::compute_rms_windows(&new_samples, full_columns);
+                    for rms in rms_windows {
+                        let normalized = (rms / 0.15).clamp(0.0, 1.0);
+                        let value = if normalized < NOISE_FLOOR {
+                            0.0
+                        } else {
+                            normalized
+                        };
+                        app.waveform_bars.push(value);
+                    }
+                    // Trim to widget width — oldest columns scroll off the left
+                    if app.waveform_bars.len() > max_columns {
+                        let excess = app.waveform_bars.len() - max_columns;
+                        app.waveform_bars.drain(..excess);
+                    }
+                }
             }
-        } else {
-            app.spectrum = SpectrumData::empty();
+        } else if app.state == RecordingState::Idle && !app.waveform_bars.is_empty() {
+            // Clear scrolling state when idle
+            app.waveform_bars.clear();
+            app.last_sample_count = 0;
+            app.leftover_samples = 0;
         }
 
         // Draw UI
@@ -266,7 +313,9 @@ async fn run_app(
                         }
                     }
                     KeyCode::Char('c')
-                        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
                     {
                         return Ok(());
                     }
@@ -279,7 +328,11 @@ async fn run_app(
 
 /// Write a timestamped line to conch.log for debugging.
 fn log(msg: &str) {
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("conch.log") {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("conch.log")
+    {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
@@ -293,7 +346,10 @@ static OPENCODE_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex:
 fn send_prompt_to_opencode(text: &str, tx: &tokio::sync::mpsc::UnboundedSender<AppMessage>) {
     let text = text.to_string();
     let tx = tx.clone();
-    log(&format!("send_prompt: queuing prompt ({} chars)", text.len()));
+    log(&format!(
+        "send_prompt: queuing prompt ({} chars)",
+        text.len()
+    ));
     tokio::spawn(async move {
         let session_id = OPENCODE_SESSION_ID.lock().unwrap().clone();
         let Some(session_id) = session_id else {
@@ -330,12 +386,18 @@ async fn connect_opencode(
             }
             Ok(false) => {
                 log("connect_opencode: health check returned false, retrying...");
-                let _ = tx.send(AppMessage::ConnectionChanged(ConnectionStatus::Reconnecting));
+                let _ = tx.send(AppMessage::ConnectionChanged(
+                    ConnectionStatus::Reconnecting,
+                ));
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
             Err(e) => {
-                log(&format!("connect_opencode: health check error: {e}, retrying..."));
-                let _ = tx.send(AppMessage::ConnectionChanged(ConnectionStatus::Reconnecting));
+                log(&format!(
+                    "connect_opencode: health check error: {e}, retrying..."
+                ));
+                let _ = tx.send(AppMessage::ConnectionChanged(
+                    ConnectionStatus::Reconnecting,
+                ));
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -351,15 +413,22 @@ async fn connect_opencode(
         // Try to reuse existing session for this directory
         match client.list_sessions().await {
             Ok(sessions) => {
-                log(&format!("connect_opencode: found {} sessions", sessions.len()));
+                log(&format!(
+                    "connect_opencode: found {} sessions",
+                    sessions.len()
+                ));
                 let cwd = std::env::current_dir()
                     .ok()
                     .map(|p| p.to_string_lossy().to_string());
-                let existing = sessions.iter().find(|s| {
-                    s.directory.as_ref() == cwd.as_ref()
-                });
+                let existing = sessions
+                    .iter()
+                    .find(|s| s.directory.as_ref() == cwd.as_ref());
                 if let Some(s) = existing {
-                    log(&format!("connect_opencode: reusing session {} ({})", s.id, s.slug.as_deref().unwrap_or("?")));
+                    log(&format!(
+                        "connect_opencode: reusing session {} ({})",
+                        s.id,
+                        s.slug.as_deref().unwrap_or("?")
+                    ));
                     client.set_session(s.id.clone());
                     let _ = tx.send(AppMessage::SessionReady {
                         _id: s.id.clone(),
@@ -405,7 +474,9 @@ async fn connect_opencode(
     };
 
     // Store session ID for the prompt sender
-    log(&format!("connect_opencode: session ready, storing ID for prompt sender"));
+    log(&format!(
+        "connect_opencode: session ready, storing ID for prompt sender"
+    ));
     *OPENCODE_SESSION_ID.lock().unwrap() = Some(session_id);
 
     // SSE event loop with reconnection
@@ -515,11 +586,11 @@ fn render(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Length(3), // Spectrogram
-            Constraint::Length(3), // Status
-            Constraint::Min(6),   // Transcripts
-            Constraint::Length(3), // Help bar
+            Constraint::Length(3),  // Title
+            Constraint::Length(10), // Waveform (8 content rows = 32 braille dots tall)
+            Constraint::Length(3),  // Status
+            Constraint::Min(6),     // Transcripts
+            Constraint::Length(3),  // Help bar
         ])
         .split(area);
 
@@ -559,19 +630,16 @@ fn render(f: &mut ratatui::Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
-    // Spectrogram
-    let is_recording = app.state == RecordingState::Recording;
-    let spec_block = Block::default()
-        .title(if is_recording {
-            " ▁▂▃▅▇ Listening "
-        } else {
-            " Audio "
-        })
-        .borders(Borders::ALL);
-    let spec_inner = spec_block.inner(chunks[1]);
-    f.render_widget(spec_block, chunks[1]);
-    let spec_widget = SpectrogramWidget::new(&app.spectrum, is_recording);
-    f.render_widget(spec_widget, spec_inner);
+    // Waveform
+
+    let waveform_data = WaveformData {
+        bars: app.waveform_bars.clone(),
+    };
+    let wave_block = Block::default();
+    let wave_inner = wave_block.inner(chunks[1]);
+    f.render_widget(wave_block, chunks[1]);
+    let wave_widget = WaveformWidget::new(&waveform_data);
+    f.render_widget(wave_widget, wave_inner);
 
     // Status area
     let (status_text, status_color) = if app.prompt_pending.is_some() {
@@ -668,7 +736,6 @@ fn render(f: &mut ratatui::Frame, app: &App) {
         Span::styled("[q/Esc] ", Style::default().fg(Color::Cyan)),
         Span::raw("Quit"),
     ]);
-    let help = Paragraph::new(Line::from(help_spans))
-        .block(Block::default().borders(Borders::ALL));
+    let help = Paragraph::new(Line::from(help_spans)).block(Block::default().borders(Borders::ALL));
     f.render_widget(help, chunks[4]);
 }
