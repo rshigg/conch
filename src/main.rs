@@ -32,6 +32,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use audio::{AudioCapture, RecordingState};
+use focus::FocusState;
 use stt::Transcriber;
 use transport::{
     ConnectionStatus, OpenCodeClient, ServerEvent, extract_sse_data_lines, parse_sse_event,
@@ -63,6 +64,8 @@ struct App {
     session_slug: Option<String>,
     /// Whether OpenCode is currently busy processing.
     opencode_busy: bool,
+    /// Focus stack state.
+    focus: FocusState,
 }
 
 impl App {
@@ -77,6 +80,7 @@ impl App {
             connection_status: ConnectionStatus::Disconnected,
             session_slug: None,
             opencode_busy: false,
+            focus: FocusState::new(),
         }
     }
 }
@@ -210,7 +214,9 @@ async fn run_app(
                             "tui: tool event: {} (state: {})",
                             te.tool, te.state
                         ));
-                        // TODO: Phase 4 — forward to focus module
+                        if let Some(entry) = focus::map_tool_event(te) {
+                            app.focus.append(entry);
+                        }
                     }
                     ServerEvent::Heartbeat => {}
                 },
@@ -272,12 +278,28 @@ async fn run_app(
                     KeyCode::Enter => {
                         if let Some(text) = app.prompt_pending.take() {
                             app.error = None;
-                            send_prompt_to_opencode(&text, &tx);
+                            let prompt = if let Some(ctx) = app.focus.to_context_string() {
+                                format!("{}\n{}", ctx, text)
+                            } else {
+                                text
+                            };
+                            send_prompt_to_opencode(&prompt, &tx);
                         }
                     }
                     KeyCode::Backspace | KeyCode::Delete => {
                         if app.prompt_pending.take().is_some() {
                             app.error = Some("Prompt discarded".into());
+                        }
+                    }
+                    KeyCode::Up => {
+                        app.focus.move_up();
+                    }
+                    KeyCode::Down => {
+                        app.focus.move_down();
+                    }
+                    KeyCode::Char('f') => {
+                        if app.prompt_pending.is_none() {
+                            app.focus.toggle_follow_mode();
                         }
                     }
                     KeyCode::Char('c')
@@ -556,8 +578,9 @@ fn render(f: &mut ratatui::Frame, app: &App) {
         .constraints([
             Constraint::Length(3),  // Title
             Constraint::Length(10), // Waveform (8 content rows = 32 braille dots tall)
+            Constraint::Length(2),  // Transcript (borderless, compact)
             Constraint::Length(3),  // Status
-            Constraint::Min(6),     // Transcripts
+            Constraint::Min(6),     // Focus Stack
             Constraint::Length(3),  // Help bar
         ])
         .split(area);
@@ -609,6 +632,32 @@ fn render(f: &mut ratatui::Frame, app: &App) {
     let wave_widget = WaveformWidget::new(&waveform_data);
     f.render_widget(wave_widget, wave_inner);
 
+    // Transcript area (borderless, compact — just latest text below waveform)
+    let transcript_line = if let Some(pending) = &app.prompt_pending {
+        Line::from(vec![
+            Span::styled("  \u{25B6} ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                pending.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" [pending]", Style::default().fg(Color::DarkGray)),
+        ])
+    } else if let Some(last) = app.transcripts.last() {
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(last.clone(), Style::default().fg(Color::White)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "  No transcripts yet",
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    let transcript = Paragraph::new(transcript_line);
+    f.render_widget(transcript, chunks[2]);
+
     // Status area
     let (status_text, status_color) = if app.prompt_pending.is_some() {
         (
@@ -625,67 +674,50 @@ fn render(f: &mut ratatui::Frame, app: &App) {
                 }
             }
             RecordingState::Recording => {
-                ("  ● Recording... press [Space] to stop".into(), Color::Red)
+                ("  \u{25CF} Recording... press [Space] to stop".into(), Color::Red)
             }
-            RecordingState::Processing => ("  ⏳ Transcribing...".into(), Color::Yellow),
+            RecordingState::Processing => ("  \u{23F3} Transcribing...".into(), Color::Yellow),
         }
     };
     let status = Paragraph::new(status_text)
         .style(Style::default().fg(status_color))
         .block(Block::default().title(" Status ").borders(Borders::ALL));
-    f.render_widget(status, chunks[2]);
+    f.render_widget(status, chunks[3]);
 
-    // Transcript area
-    let transcript_lines: Vec<Line> = if app.transcripts.is_empty() {
+    // Focus Stack area
+    let focus_title = if app.focus.follow_mode() {
+        " Focus Stack (follow) "
+    } else {
+        " Focus Stack "
+    };
+    let focus_lines: Vec<Line> = if app.focus.len() == 0 {
         vec![Line::from(Span::styled(
-            "  No transcripts yet",
+            "  No focus entries yet",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        app.transcripts
+        app.focus
+            .entries()
             .iter()
             .enumerate()
-            .rev()
-            .take(50)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|(i, t)| {
-                let is_pending = app
-                    .prompt_pending
-                    .as_ref()
-                    .map(|p| p == t && i == app.transcripts.len() - 1)
-                    .unwrap_or(false);
-                let style = if is_pending {
+            .map(|(i, entry)| {
+                let is_current = i == app.focus.pointer();
+                let indicator = if is_current { "\u{25B8} " } else { "  " };
+                let style = if is_current {
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
-                Line::from(vec![
-                    Span::styled(
-                        format!("  {}. ", i + 1),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(t.clone(), style),
-                    if is_pending {
-                        Span::styled(" [pending]", Style::default().fg(Color::DarkGray))
-                    } else {
-                        Span::raw("")
-                    },
-                ])
+                Line::from(Span::styled(format!("{}{}", indicator, entry), style))
             })
             .collect()
     };
-    let transcripts = Paragraph::new(transcript_lines)
-        .block(
-            Block::default()
-                .title(" Transcripts ")
-                .borders(Borders::ALL),
-        )
+    let focus_widget = Paragraph::new(focus_lines)
+        .block(Block::default().title(focus_title).borders(Borders::ALL))
         .wrap(Wrap { trim: false });
-    f.render_widget(transcripts, chunks[3]);
+    f.render_widget(focus_widget, chunks[4]);
 
     // Help bar
     let mut help_spans = vec![
@@ -701,9 +733,13 @@ fn render(f: &mut ratatui::Frame, app: &App) {
         ]);
     }
     help_spans.extend([
+        Span::styled("[\u{2191}\u{2193}] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Focus  "),
+        Span::styled("[f] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Follow  "),
         Span::styled("[q/Esc] ", Style::default().fg(Color::Cyan)),
         Span::raw("Quit"),
     ]);
     let help = Paragraph::new(Line::from(help_spans)).block(Block::default().borders(Borders::ALL));
-    f.render_widget(help, chunks[4]);
+    f.render_widget(help, chunks[5]);
 }

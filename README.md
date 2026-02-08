@@ -2,23 +2,25 @@
 
 A standalone Rust TUI application that provides voice input for [OpenCode](https://github.com/anomalyco/opencode) using local speech-to-text via Whisper.cpp.
 
-## Phases 1-3 Complete ✓
+## Phases 1-4 Complete
 
-- ✅ Audio capture via cpal with push-to-talk
-- ✅ Local speech-to-text transcription via whisper-rs
-- ✅ Minimal TUI displaying transcripts
-- ✅ Ring buffer for audio data
-- ✅ Automatic resampling to 16kHz for Whisper
-- ✅ Live FFT-based spectrogram during recording via rustfft
-- ✅ Half-block character bars with green/yellow/red color coding
-- ✅ RMS-gated noise floor so silence stays quiet on screen
-- ✅ HTTP transport to OpenCode server (prompt sending)
-- ✅ SSE event stream subscription with auto-reconnection
-- ✅ Session management (reuse or create)
-- ✅ Prompt confirmation flow (Enter to send, Backspace to discard)
-- ✅ Connection status indicator in TUI
+- Audio capture via cpal with push-to-talk
+- Local speech-to-text transcription via whisper-rs
+- Minimal TUI displaying transcripts
+- Ring buffer for audio data
+- Automatic resampling to 16kHz for Whisper
+- Live braille waveform visualization during recording
+- RMS-gated noise floor so silence stays quiet on screen
+- HTTP transport to OpenCode server (prompt sending)
+- SSE event stream subscription with auto-reconnection
+- Session management (reuse or create)
+- Prompt confirmation flow (Enter to send, Backspace to discard)
+- Connection status indicator in TUI
+- Focus stack derived from OpenCode tool events
+- Pointer navigation with follow mode (like `less +F`)
+- Focus context automatically prepended to voice prompts
 
-**Goal achieved**: Press Space, speak, confirm with Enter, and the transcript is sent to OpenCode.
+**Goal achieved**: Press Space, speak, confirm with Enter, and the transcript (with focus context) is sent to OpenCode. The focus stack tracks what OpenCode is working on in real time.
 
 ## Prerequisites
 
@@ -63,14 +65,34 @@ The binary will be at `target/release/conch`.
 
 ## Usage
 
+| Key | Action |
+|-----|--------|
+| **Space** | Start/stop recording |
+| **Enter** | Send pending transcript to OpenCode |
+| **Backspace** | Discard pending transcript |
+| **Up/Down** | Navigate focus stack history |
+| **f** | Toggle follow mode (auto-track latest focus) |
+| **q / Esc** | Quit |
+
+### Workflow
+
 1. Press **Space** to start recording
 2. Speak your command (e.g., "open the config file")
 3. Press **Space** again to stop recording
-4. Wait for transcription (1-3 seconds)
+4. Wait for transcription (~0.3s for short utterances in release mode)
 5. See the transcript appear in the TUI (highlighted as pending)
 6. Press **Enter** to send to OpenCode, or **Backspace** to discard
 
-Press **q** or **Esc** to quit.
+### Focus Stack
+
+The focus stack tracks what OpenCode is working on by mapping tool events to typed entries:
+
+- **File** — from `read`, `write`, `edit` tool calls
+- **Directory** — from `list` calls or `bash cd` commands
+- **Branch** — from `git checkout` / `git switch` commands
+- **Commit** — from `git commit` commands
+
+Use **Up/Down** arrows to browse history. Press **f** to toggle follow mode, which auto-scrolls to the latest entry. The current focus is automatically included as context in your voice prompts, so OpenCode knows what you're referring to when you say things like "open it" or "fix that".
 
 ### OpenCode Connection
 
@@ -97,7 +119,7 @@ Conch is organized into five modules:
 1. **audio** — cpal-based microphone capture, ring buffer
 2. **stt** — whisper-rs wrapper for local transcription
 3. **viz** — FFT-based spectrogram visualization
-4. **focus** — Focus stack derived from OpenCode events (Phase 4)
+4. **focus** — Focus stack derived from OpenCode tool events
 5. **transport** — HTTP/SSE communication with OpenCode (Phase 3)
 
 ## Testing
@@ -142,13 +164,16 @@ cargo test -- --ignored
 - [x] Async tokio runtime
 - [x] 32 passing unit tests
 
-### Phase 4: Focus Module
+### Phase 4: Focus Module ✓
 
-- [ ] Event-to-focus mapping rules
-- [ ] Focus history derived from OpenCode log
-- [ ] Pointer navigation (up/down arrows)
-- [ ] Follow mode (like `less +F`)
-- [ ] Context injection into prompts
+- [x] Event-to-focus mapping rules (read/write/edit/bash/list)
+- [x] Focus history with newest-first ordering
+- [x] Pointer navigation (up/down arrows)
+- [x] Follow mode (like `less +F`, toggle with `f`)
+- [x] Context injection into prompts
+- [x] Bash command parsing (cd, git checkout, git commit)
+- [x] Session rebuild from event log
+- [x] 52 passing unit tests
 
 ### Phase 5: Polish
 
@@ -195,4 +220,6 @@ See LICENSE file.
 
 - [VOICE_CLIENT_PLAN.md](VOICE_CLIENT_PLAN.md) — Complete project plan
 - [TESTING.md](TESTING.md) — Comprehensive test documentation
-- [OpenCode](https://github.com/anomalyco/opencode) — The AI coding agent this client interfaces with
+- [OpenCode](https://github.com/sst/opencode) — The AI coding agent this client interfaces with
+- [OpenCode SDK](https://github.com/sst/opencode-sdk-js) — TypeScript SDK (generated from OpenAPI spec)
+- [OPENCODE_SSE_SPEC.md](OPENCODE_SSE_SPEC.md) — SSE event format reference

@@ -168,9 +168,16 @@ pub fn parse_sse_event(json_str: &str) -> Option<ServerEvent> {
             if part["type"].as_str()? != "tool" {
                 return None;
             }
-            let tool = part["toolName"].as_str().unwrap_or("").to_string();
-            let input = part.get("input").cloned().unwrap_or(serde_json::Value::Null);
-            let state = part["state"].as_str().unwrap_or("unknown").to_string();
+            // Tool name is at part.tool (not part.toolName)
+            let tool = part["tool"].as_str().unwrap_or("").to_string();
+            // State is an object: part.state.status is the status string,
+            // part.state.input holds the tool input
+            let state_obj = &part["state"];
+            let state = state_obj["status"].as_str().unwrap_or("unknown").to_string();
+            let input = state_obj
+                .get("input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             Some(ServerEvent::Tool(ToolEvent {
                 tool,
                 input,
@@ -217,12 +224,13 @@ mod tests {
 
     #[test]
     fn test_parse_tool_event_from_sse() {
-        let json = r#"{"type":"message.part.updated","properties":{"part":{"id":"p1","sessionID":"s1","messageID":"m1","type":"tool","toolName":"read","input":{"path":"src/main.rs"},"state":"completed"}}}"#;
+        // Real OpenCode format: tool name at part.tool, state is object with status/input
+        let json = r#"{"type":"message.part.updated","properties":{"part":{"id":"p1","sessionID":"s1","messageID":"m1","type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"},"output":"...","title":"","metadata":{},"time":{"start":1,"end":2}}}}}"#;
         let event = parse_sse_event(json).unwrap();
         match event {
             ServerEvent::Tool(te) => {
                 assert_eq!(te.tool, "read");
-                assert_eq!(te.input["path"], "src/main.rs");
+                assert_eq!(te.input["filePath"], "src/main.rs");
                 assert_eq!(te.state, "completed");
             }
             _ => panic!("expected Tool event"),
@@ -231,12 +239,12 @@ mod tests {
 
     #[test]
     fn test_parse_write_tool_event() {
-        let json = r#"{"type":"message.part.updated","properties":{"part":{"type":"tool","toolName":"write","input":{"path":"src/utils.ts","content":"hello"},"state":"completed"}}}"#;
+        let json = r#"{"type":"message.part.updated","properties":{"part":{"type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"src/utils.ts","content":"hello"},"output":"","title":"","metadata":{},"time":{"start":1,"end":2}}}}}"#;
         let event = parse_sse_event(json).unwrap();
         match event {
             ServerEvent::Tool(te) => {
                 assert_eq!(te.tool, "write");
-                assert_eq!(te.input["path"], "src/utils.ts");
+                assert_eq!(te.input["filePath"], "src/utils.ts");
             }
             _ => panic!("expected Tool event"),
         }
@@ -244,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_parse_bash_tool_event() {
-        let json = r#"{"type":"message.part.updated","properties":{"part":{"type":"tool","toolName":"bash","input":{"command":"cd src"},"state":"running"}}}"#;
+        let json = r#"{"type":"message.part.updated","properties":{"part":{"type":"tool","tool":"bash","state":{"status":"running","input":{"command":"cd src","description":"change dir"},"time":{"start":1}}}}}"#;
         let event = parse_sse_event(json).unwrap();
         match event {
             ServerEvent::Tool(te) => {
@@ -258,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_parse_list_tool_event() {
-        let json = r#"{"type":"message.part.updated","properties":{"part":{"type":"tool","toolName":"list","input":{"path":"src/components"},"state":"completed"}}}"#;
+        let json = r#"{"type":"message.part.updated","properties":{"part":{"type":"tool","tool":"list","state":{"status":"completed","input":{"path":"src/components"},"output":"...","title":"","metadata":{},"time":{"start":1,"end":2}}}}}"#;
         let event = parse_sse_event(json).unwrap();
         match event {
             ServerEvent::Tool(te) => {
@@ -271,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_parse_edit_tool_event() {
-        let json = r#"{"type":"message.part.updated","properties":{"part":{"type":"tool","toolName":"edit","input":{"filePath":"README.md"},"state":"completed"}}}"#;
+        let json = r#"{"type":"message.part.updated","properties":{"part":{"type":"tool","tool":"edit","state":{"status":"completed","input":{"filePath":"README.md","oldString":"a","newString":"b"},"output":"","title":"","metadata":{},"time":{"start":1,"end":2}}}}}"#;
         let event = parse_sse_event(json).unwrap();
         match event {
             ServerEvent::Tool(te) => {
@@ -391,7 +399,7 @@ mod tests {
     #[test]
     fn test_tool_event_missing_tool_name() {
         // Should still parse, with empty tool name
-        let json = r#"{"type":"message.part.updated","properties":{"part":{"type":"tool","input":{},"state":"completed"}}}"#;
+        let json = r#"{"type":"message.part.updated","properties":{"part":{"type":"tool","state":{"status":"completed","input":{},"output":"","title":"","metadata":{},"time":{"start":1,"end":2}}}}}"#;
         let event = parse_sse_event(json).unwrap();
         match event {
             ServerEvent::Tool(te) => {
